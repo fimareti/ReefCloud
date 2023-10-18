@@ -1,0 +1,689 @@
+---
+title: "Bayesian modelling part3"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: spacelab
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    highlight-style: zenburn
+    ## Execution
+    execute:
+      echo: true
+      cache: false
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+# Preparations
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse)
+library(easystats)
+library(knitr)
+library(sf)
+library(rnaturalearth)
+library(brms)
+library(rstan)
+library(tidybayes)
+library(patchwork)
+library(DHARMa)
+library(HDInterval)
+library(emmeans)
+source('helperFunctions.R')
+```
+
+    
+# Read in the data
+
+Now we will move to the raw `CairnsReefs_subset.csv` data.
+There are many functions in R that can read in a CSV file. We will use
+a the `read_csv()` function as it is part of the tidyverse ecosystem.
+
+```{r}
+#| label: readData
+dat <- read_csv("../data/Aleipata_MPA1.csv", trim_ws = TRUE) 
+```
+
+
+
+::: {.panel-tabset}
+
+## glimpse
+```{r}
+#| label: examinData
+dat |> glimpse() 
+```
+
+## head
+```{r}
+#| label: examinData1
+## Explore the first 6 rows of the data
+dat |> head() 
+```
+
+## str
+```{r}
+#| label: examinData2
+dat |> str() 
+```
+
+## Easystats (datawizard)
+```{r}
+#| label: examinData3
+dat |> datawizard::data_codebook() |> knitr::kable() 
+```
+:::
+
+
+# Data preparation
+
+
+
+Before we can model these data, they need to be processed into a
+format compatible with statistical modelling. The necessary wrangling
+steps:
+
+1. exclude extraneous (unneeded) fields
+2. exclude poor images
+3. lengthen the data with respect to classification type
+4. join to a labelset lookup
+5. tally up the points per date/image/GROUP/type
+6. recode transect id
+7. fill in the gaps and add the zeros
+8. sum to transect level
+9. generate a Year field from the sample date
+
+::: {.panel-tabset}
+
+## Exclude fields
+
+Although it is often harmless enough to retain the other fields, it
+does make reviewing the data more combersum, so at an early stage
+within this exercise, we will probably restrict the data to just the
+above fields.
+
+```{r}
+#| label: selecting 
+dat <- dat |>
+  dplyr::select(Site,
+    Longitude,
+    Latitude,
+    Exposure,
+    `Reef slope`,
+    `Reef type`,
+    `Transect number`,
+    `Benthic category`,
+    )
+dat |> as.data.frame() |> head()
+```
+## Tally up the benthic categories per transect
+```{r}
+dat<-
+  dat |>
+  group_by(Site, 
+           Longitude,
+           Latitude,
+           Exposure,
+           `Reef slope`,
+           `Reef type`,
+           `Transect number`,
+           `Benthic category`) |>
+  count(name = "COUNT") |> 
+  ungroup()
+```
+
+##fill in the blanks (0s)
+```{r}
+data.filler<- dat |>
+  dplyr::select(Site, Latitude, Longitude, Exposure, `Reef slope`,
+           `Reef type`,`Transect number`) |> 
+  distinct() |> 
+  crossing(`Benthic category` = unique(dat$`Benthic category`))
+data.filler
+
+dat <-
+  dat |> 
+ #filter(Site == "Amaile", `Transect number` == 1) |> 
+  full_join(data.filler) |> # |>  filter(Site == "Amaile", `Transect number` == 1)) |> 
+  mutate(COUNT = ifelse(is.na(COUNT), 0, COUNT)) |> 
+  group_by(Site, `Transect number`) |> 
+  mutate(TOTAL = sum(COUNT)) |> 
+  ungroup()
+
+#dat |> 
+#  filter(Site == "Amaile", `Transect number` == 1) |> 
+#  full_join(data.filler |>  filter(Site == "Amaile", `Transect number` == 1)) |> 
+#  
+#    as.data.frame()
+```
+
+
+
+
+
+
+
+
+## Recode transects
+
+```{r}
+#| label: recode_transects
+dat <- 
+  dat |>
+  mutate(transect_id = paste0(Site, `Transect number`)) 
+dat |> as.data.frame() |> head() 
+```
+
+
+
+## Declare all character vectors as categorical
+
+We will also create a categorical version of year.
+
+```{r}
+#| label: declare factors
+dat <-
+  dat |>
+  mutate(across(where(is.character), factor),
+         Exposure = factor(Exposure))
+
+dat |> as.data.frame() |> head() 
+```
+
+:::
+
+## Exploratory data analysis
+
+
+::: {.panel-tabset}
+
+### Exposure
+```{r}
+#| label: EDA1
+#| fig.width: 8
+#| fig.height: 8
+dat |>
+  filter(`Benthic category` == "Hard coral") |> 
+  ggplot(aes(y =  100*COUNT/TOTAL, x = Exposure)) +
+  geom_point() +
+  #geom_line(aes(group = transect_id)) + 
+  scale_y_continuous("Hard coral cover (%)") +
+  #scale_colour_discrete("Survey depth (m)") +
+  #scale_x_datetime("Year", date_breaks = "1 years", date_labels = "%Y") + 
+  facet_wrap(~Site) +
+  theme_classic()
+```
+
+
+**Conclusions -** variances are clearly not equal between the groups
+:::
+
+Benthic monitoring programs typically adopt a hierarchical sampling
+design in which (usually) fixed sampling units (such as quadrats or
+transects) are nested within in Sites which are in turn nested within
+progressively larger spatial units (e.g. Reefs within Regions). In
+such designs, monitors collect data from those same units over
+multiple years.  That is, the units are repeatedly measured.
+
+Such a design is an attempt to control some of the numerous sources of
+uncertainty that would otherwise make it very difficult to draw out a
+signal (temporal pattern) amongst the noise. If instead, researchers
+sampled different locations each year, it is much harder to uncouple
+how much of any changes are due to genuine temporal shifts and how
+much is due to just a shift in location.
+
+Whist this design does provide substantial statistical power
+advantages, it does introduce additional complexities to do with the
+independence of observations. Repeated observations from the same
+sampling units (transects etc) are not independent. Similarly,
+observations of sampling units that are close in space (or time) are
+likely to be highly correlated. This violates a important assumption
+that underlies most statistical analyses.
+
+Complex hierarchical statistical designs exist to accommodate these
+dependency issues. Although such analyses are very powerful, they are
+not a good starting point when learning how to fit models. This series
+of workshops is intended to progressively increase the complexity of
+the statistical designs and analyses.
+
+The current dataset represents only a tiny fraction of a much larger
+dataset that includes multiple sites, reefs and years. As such, it has
+been prepared to fill in for a very simple design/analyses.
+
+::: {.callout-important}
+Unfortunately, these data are still not appropriate for a very simple
+analyses for the following two reasons:
+
+- as we can see in the time series figure above, the earlier samples
+  were collected at a depth of 9m whereas the later samples were
+  collected at 7m
+- the samples each year are not independent as they were collected
+  from the same transects - that is the sampling units have been
+  repeatedly sampled and thus are not independent.
+
+I fully acknowledge this issue and therefore acknowledge that the
+analysis I will present is completely invalid.
+:::
+
+
+```{r, mhiden=TRUE}
+#| label: hard coral
+dat_hc <- dat |>
+  filter(`Benthic category` == "Hard coral") |>
+  droplevels()
+```
+
+
+
+# Fit models
+
+::: {.panel-tabset}
+
+## Binomial model
+
+$$
+\begin{align}
+y_{i} &\sim{} Bin(\pi_{i}, n_{i})\\
+log\left(\frac{\pi_i}{1-\pi_i}\right) &= \beta_0 + \beta_{i}\mathbf{X}\\
+\beta_0 \sim{} N(0, 1)\\
+\beta_{1-3} \sim{} N(0, 1)\\
+\end{align}
+$$
+
+:::: {.panel-tabset}
+
+### Define priors
+```{r}
+dat_hc |>
+  mutate(COVER = COUNT/TOTAL) |>
+  group_by(Exposure) |>
+  summarise(
+    qlogis(mean(COVER)),
+    qlogis(sd(COVER))
+  )
+```
+```{r}
+priors <- prior(normal(0,1), class = "Intercept")+
+  prior(normal(0,1), class = "b")
+
+form <- bf(COUNT | trials(TOTAL)~ Exposure,
+           family = binomial(link = "logit"))
+#it can be called random intercept model, a 1 stands for intercept. The intercept is conditional on according to reef : the intercept varies according to each column reef-id,site name,transect id
+```
+
+```{r}
+priors <- prior(normal(0,1), class = "Intercept")+
+  prior(normal(0,1), class = "b")#+ #fixed prior
+ # prior(student_t(3, 0, 1), class = "sd") #random prior
+
+model1<- brm(form,
+             data = dat_hc,
+             prior = priors,
+             sample_prior = "only",
+             warmup = 1000,
+             chains = 3,
+             cores = 3,
+             thin = 5,
+             refresh = 1000,
+             backend = "rstan")
+```
+
+```{r}
+model1 |>
+  conditional_effects() |>
+  plot() |>
+  _[[1]]+
+  geom_point(data = dat_hc,aes(y = COUNT/TOTAL, x = Exposure), inherit.aes = FALSE)
+```
+
+
+```{r}
+model1 <- update(model1, sample_prior = "yes", refresh = 1000)
+```
+
+### Fit full model
+```{r}
+model1 |> 
+  conditional_effects() |>
+  plot() |>
+  _[[1]]+
+  geom_point(data = dat_hc, aes(y=COUNT/TOTAL, x = Exposure), inherit.aes = FALSE)
+
+```
+```{r}
+model1 |> SUYR_prior_and_posterior()
+model1$fit |> stan_trace()
+model1$fit |> stan_ac()
+model1$fit |> stan_rhat()
+model1$fit |> stan_ess()
+```
+
+
+
+
+
+### MCMC sampling diagnostics
+
+
+### Posterior probability checks
+```{r}
+#| fig.width: 12
+#| fig.height: 6
+model1 |> pp_check(type = "dens_overlay", ndraws = 100)
+resids <- model1 |> make_brms_dharma_res(integerResponse = FALSE)
+wrap_elements(~testUniformity(resids))+
+  wrap_elements(~plotResiduals(resids,form = factor(rep(1, nrow(dat_hc)))))+
+  wrap_elements(~plotResiduals(resids))+
+  wrap_elements(~testDispersion(resids))
+```
+
+## Beta-binomial
+```{r}
+form <- bf(COUNT | trials(TOTAL)~ Exposure,
+           family = beta_binomial(link = "logit"))
+#it can be called random intercept model, a 1 stands for intercept. The intercept is conditional on according to reef : the intercept varies according to each column reef-id,site name,transect id
+```
+
+```{r}
+priors <- prior(normal(0,1), class = "Intercept")+
+  prior(normal(0,1), class = "b") +
+  prior(gamma(0.01, 0.01), class = "phi") #+ #fixed prior
+ # prior(student_t(3, 0, 1), class = "sd") #random prior
+
+model1<- brm(form,
+             data = dat_hc,
+             prior = priors,
+             sample_prior = "only",
+             warmup = 1000,
+             chains = 3,
+             cores = 3,
+             thin = 5,
+             refresh = 1000,
+             backend = "rstan")
+save(model1, file = "model1a.RData")
+```
+
+```{r}
+model1 |> conditional_effects()
+```
+
+```{r}
+model1 <- update(model1, sample_prior = "yes", refresh = 1000)
+save(model1, file = "model1b.RData")
+```
+
+```{r}
+model1 |> conditional_effects()
+```
+```{r}
+#| fig.width: 12
+#| fig.height: 6
+model1 |> pp_check(type = "dens_overlay", ndraws = 100)
+resids <- model1 |> make_brms_dharma_res(integerResponse = FALSE)
+wrap_elements(~testUniformity(resids))+
+  wrap_elements(~plotResiduals(resids,form = factor(rep(1, nrow(dat_hc)))))+
+  wrap_elements(~plotResiduals(resids))+
+  wrap_elements(~testDispersion(resids))
+```
+
+```{r}
+geom_point(data = dat_hc,aes(y = COUNT/TOTAL, x = Exposure), inherit.aes = FALSE)
+```
+
+```{r}
+model1 |> as_draws_df() |>
+  summarise_draws(median, HDInterval::hdi,rhat,length,ess_bulk, ess_tail) |>
+  knitr::kable()
+```
+```{r}
+plogis(-1.64) 
+exp(-1.64) #odds for being hard coral or something else
+1/exp(-1.64) #5 times more likely what i just hit is something else not coral
+#present not on a logit scale but an odd scale 
+```
+```{r}
+model1 |> as_draws_df() |>
+  dplyr::select(starts_with("b")) |>
+  mutate(across(everything(), exp)) |> 
+  summarise_draws(median, 
+                  hdi,
+                  rhat,
+                  length,
+                  Pl = ~mean(. < 1),
+                  Pg = ~mean(. > 1)) |>
+  knitr::kable() #increase Higher than 1, decrease lower than 1
+```
+
+
+### Model validation
+
+##pairwise contrasts 
+
+```{r}
+model1 |> 
+emmeans(~ Exposure) |>
+  regrid() |>
+  pairs() |>
+  gather_emmeans_draws() |>
+  summarise(median_hdci(.value),
+            Pl = mean(.value < 0),
+            Pg = mean(.value > 0)) |>
+ knitr::kable()
+```
+```{r}
+model1 |> 
+emmeans(~ Exposure) |>
+  regrid() |>
+  regrid(trans = "log") |>
+  pairs() |>
+  gather_emmeans_draws() |>
+  mutate(.value = exp(.value)) |> 
+  summarise(median_hdci(.value),
+            Pl = mean(.value < 1),
+            Pg = mean(.value > 1)) |>
+ knitr::kable()
+```
+```{r}
+g1<-
+  model1|>
+  emmeans(~Exposure,type = "response") |>
+  regrid () |>
+  pairs() |> #percentage changes to produce the plot 
+  gather_emmeans_draws() |> #give me all 2400 of the values
+  mutate(contrast = str_replace_all(contrast, "Exposure", "")) |> #replace fYear with nothing 
+  ggplot(aes(x = .value, y = contrast))+ #the column .value on x axis
+  stat_halfeye(aes(fill = after_stat(level)), .width = c(0.66, 0.95,1))+ #produce density plots and fill it according to different proportion of the data
+ # scale_fill_viridis_c() +
+  scale_fill_brewer(palette = "Purples")+ #overwritten to have a different color pallet, color brewer is used for mapping you can change it to any color 
+  geom_vline(xintercept = 0, linetype = "dashed")+ #dashed line 
+  scale_x_continuous("Effect size")+ #providing nicer labels
+  scale_y_discrete("") +
+  theme_classic() +
+  theme(legend.position = "top",
+        legend.direction = "horizontal")
+```
+```{r}
+g2<-
+  model1|>
+  emmeans(~Exposure) |>
+  gather_emmeans_draws() |>
+  mutate(fit = plogis(.value)) |>
+  summarise(median_hdci(fit)) |>
+  ggplot(aes(y = y, x = Exposure))+
+  geom_pointrange(aes(ymin = ymin, ymax = ymax))+
+  scale_y_continuous("Coral cover (%)", labels = scales::label_number(scale = 100))+
+  scale_x_discrete("")+
+  theme_classic()
+#| fig.width: 12
+#| fig.height: 6
+(g1 +annotate_npc(" a)", x = 0, y = 1, hjust = 0, vjust = 1))+
+(g2 + annotate_npc(" b)", x = 0, y = 1, hjust = 0, vjust = 1))
+```
+
+
+```{r}
+theme_classic()
+```
+
+###high vs low
+
+::::
+```{r}
+cmat<- cbind("High vs Low" = c(0, -1/2, -1/2, 0, 1/2, 1/2),
+            "Pre vs Post" = c(-1/3, -1/3, -1/3, 1/3, 1/3, 1/3))
+
+```
+```{r}
+model1 |>
+emmeans(~ fYear) |>
+  regrid() |>
+  contrast(method = list(fYear = cmat)) |> 
+  #regrid(trans = "log") |>
+ # pairs() |>
+  gather_emmeans_draws() |>
+  mutate(.value = exp(.value)) |> 
+  summarise(median_hdci(.value),
+            Pl = mean(.value < 1),
+            Pg = mean(.value > 1))|>
+ knitr::kable()
+```
+
+##R2
+```{r}
+model1 |> bayes_R2(summary = FALSE, re_form = ~(1|Reef_id) + (1| site_name)+ (1|transect_id)) |>
+  median_hdci()#|>
+ #knitr::kable()
+```
+```{r}
+model1 |> as_draws_df()
+
+```
+```{r}
+model1 |> get_variables()
+```
+```{r}
+model1 |> as_draws_df() |> mutate(Agincourt  = plogis (b_Intercept + `r_Reef_id[Agincourt.Reef.No.1,Intercept]`)) |>
+  median_hdci(Agincourt)
+```
+
+## Beta-Binomial model
+
+$$
+\begin{align}
+y_{i} &\sim{} Beta-Bin(\pi_{i}, n_{i})\\
+log\left(\frac{\pi_i}{1-\pi_i}\right) &= \beta_0 + \beta_{1i}  + \beta_{2i} + \beta_{3i}\\
+\beta_0 \sim{} N(0, 1)\\
+\beta_{1-3} \sim{} N(0, 1)\\
+\end{align}
+$$
+
+:::: {.panel-tabset}
+
+### Define priors
+
+
+### Fit prior only model
+
+
+
+
+### Fit full model
+
+
+
+
+
+### MCMC sampling diagnostics
+
+
+### Posterior probability checks
+
+
+### Model validation
+
+::::
+
+:::
+
+# Model posterior summaries
+
+
+
+
+# Further explorations
+
+::: {.panels-tabset}
+
+## Pairwise constrasts
+
+
+If we want to express this in percentage units
+
+
+
+## Specific contrasts
+
+Lets compare 2017 to the average of 2018, 2020 and 2021
+
+
+## R2
+
+
+
+:::
+# Summary figures
+
