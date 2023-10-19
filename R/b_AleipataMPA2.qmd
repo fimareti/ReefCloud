@@ -366,6 +366,8 @@ form <- bf(COUNT | trials(TOTAL)~ Reef_type,
 ```
 
 ```{r}
+#| label: fitModel1
+#| cache: true
 priors<- prior(normal(0,1), class = "Intercept") +
   prior(normal (0,3), class = "b")
 form<- bf(COUNT | trials(TOTAL) ~ Reef_type, family = binomial (link = "logit"))
@@ -392,6 +394,8 @@ model2|>
 
 
 ```{r}
+#| label: updateModel1
+#| cache: true
 model2 <- update(model2, sample_prior = "yes", refresh = 1000)
 ```
 
@@ -439,6 +443,8 @@ form <- bf(COUNT | trials(TOTAL)~ Reef_type,
 ```
 
 ```{r}
+#| label: fitModel1
+#| cache: true
 priors <- prior(normal(0,1), class = "Intercept")+
   prior(normal(0,1), class = "b") +
   prior(gamma(0.01, 0.01), class = "phi") #+ #fixed prior
@@ -461,6 +467,8 @@ model2 |> conditional_effects()
 ```
 
 ```{r}
+#| label: updateModel
+#| cache: true
 model2 <- update(model2, sample_prior = "yes", refresh = 1000)
 ```
 
@@ -564,11 +572,14 @@ g2<-
   scale_y_continuous("Coral cover (%)", labels = scales::label_number(scale = 100))+
   scale_x_discrete("")+
   theme_classic()
+```
+```{r}
 #| fig.width: 12
-#| fig.height: 6
+#| fig.height: 8
 (g1 +annotate_npc(" a)", x = 0, y = 1, hjust = 0, vjust = 1))+
 (g2 + annotate_npc(" b)", x = 0, y = 1, hjust = 0, vjust = 1))
 ```
+
 
 
 
