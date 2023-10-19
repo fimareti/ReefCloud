@@ -1,0 +1,750 @@
+---
+title: "Bayesian modelling part4"#using waitt_samoa file
+author: "Fimareti Selu"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: spacelab
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    fig-caption-location: "bottom"
+    fig-align: "center"
+
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    highlight-style: zenburn
+    ## Execution
+    execute:
+      echo: true
+      cache: false
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+# Preparations
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse)
+library(easystats)
+library(knitr)
+library(sf)
+library(rnaturalearth)
+library(maps)
+library(brms)
+library(rstan)
+library(tidybayes)
+library(patchwork)
+library(DHARMa)
+library(HDInterval)
+library(emmeans)
+source('helperFunctions.R')
+```
+
+    
+# Read in the data
+
+Now we will move to the raw `CairnsReefs_subset.csv` data.
+There are many functions in R that can read in a CSV file. We will use
+a the `read_csv()` function as it is part of the tidyverse ecosystem.
+
+```{r}
+#| label: readData
+dat <- read_csv("../data/Samoa_Waitt_updated.csv", trim_ws = TRUE)
+```
+
+```{r}
+#| label: readLabelset
+labelset <- read_csv("../data/ReefCloudlabelset.csv", trim_ws = TRUE) 
+```
+
+
+::: {.panel-tabset}
+
+## glimpse
+```{r}
+#| label: examinData
+dat |> glimpse() 
+```
+
+## head
+```{r}
+#| label: examinData1
+## Explore the first 6 rows of the data
+dat |> head() 
+```
+
+## str
+```{r}
+#| label: examinData2
+dat |> str() 
+```
+
+## Easystats (datawizard)
+```{r}
+#| label: examinData3
+dat |> datawizard::data_codebook() |> knitr::kable() 
+```
+:::
+
+
+# Data preparation
+
+Before we can model these data, they need to be processed into a
+format compatible with statistical modelling. The necessary wrangling
+steps:
+
+1. exclude extraneous (unneeded) fields
+2. exclude poor images
+3. lengthen the data with respect to classification type
+4. join to a labelset lookup
+5. tally up the points per date/image/GROUP/type
+6. recode transect id
+7. fill in the gaps and add the zeros
+8. sum to transect level
+9. generate a Year field from the sample date
+
+::: {.panel-tabset}
+
+## Exclude fields
+
+Although it is often harmless enough to retain the other fields, it
+does make reviewing the data more combersum, so at an early stage
+within this exercise, we will probably restrict the data to just the
+above fields.
+
+```{r}
+#| label: selecting 
+dat <- dat |>
+  dplyr::select(site_id,
+    site_name,
+    site_latitude,
+    site_longitude,
+    survey_start_date,
+    survey_depth,
+    survey_transect_number,
+    image_id,
+    image_quality,
+    point_id,
+    point_num,
+    point_machine_classification,
+    point_human_classification
+    )
+dat |> as.data.frame() |> head()
+```
+
+
+## Excluding poor images
+
+```{r}
+#| label: filter
+dat <-
+  dat |>
+  dplyr::filter(is.na(image_quality) | image_quality != 0)  
+dat |> as.data.frame() |> head()
+dat |> dim()
+```
+
+
+## Lengthen the data
+
+```{r}
+#| label: pivot
+dat <-
+  dat |>
+  pivot_longer(cols = matches("point_.*_classification"),
+    names_to = "type",
+    values_to = "classification"
+    ) 
+dat |> as.data.frame() |> head()
+```
+
+## Joining to the group code lookup data
+Our primary interest in these data will be in exploring patterns in
+broad taxanomic groups such as *Hard coral* and *algae*. Since the
+machine learning tools behind ReefCloud are tuned to classify to finer
+taxonomic resolutions, next task will be to use a lookup table so as
+to assign the higher order group codes (HC and A) to the data.
+
+
+:::: {.panel-tabset}
+
+### glimpse
+```{r}
+#| label: examineLabelset
+labelset |> glimpse() 
+```
+
+### head
+```{r}
+#| label: examineLabelset1
+## Explore the first 6 rows of the labelseta
+labelset |> head() 
+```
+
+### str
+```{r}
+#| label: examineLabelset2
+labelset |> str() 
+```
+
+### Easystats (datawizard)
+```{r}
+#| label: examineLabelset3
+labelset |> datawizard::data_codebook() |> knitr::kable() 
+```
+::::
+
+```{r}
+#| label: join
+dat <-
+  dat |>
+  left_join(labelset |>
+              dplyr::select(CODE, GROUP = `FUNCTIONAL GROUP`),
+              by = c("classification" = "CODE")
+    ) |> 
+  mutate(GROUP = ifelse(str_detect(GROUP, "HC_.*"), "HC", GROUP))
+dat |> as.data.frame() |> head() 
+```
+
+## Exclude rows without classification
+```{r}
+dat <- dat |> 
+  filter(!is.na(classification)) |> 
+  droplevels()
+```
+
+## Tally up points
+
+Count the number of points of each type as well as sum up the total
+number of points per image.
+
+```{r}
+#| label: count
+dat <- 
+  dat |> 
+  group_by(across(c(starts_with("site"),
+    starts_with("survey"),
+    type,
+    image_id,
+    GROUP))
+  ) |>
+  summarise(COUNT = n(), .groups = "keep") |> 
+  ungroup(GROUP) |>
+  mutate(TOTAL = sum(COUNT)) |>
+  ungroup() 
+dat |> as.data.frame() |> head() 
+```
+
+## Recode transects
+
+```{r}
+#| label: recode_transects
+dat <- 
+  dat |>
+  mutate(transect_id = paste0(site_id, survey_transect_number)) 
+dat |> as.data.frame() |> head() 
+```
+
+## Fill in any gaps
+
+Since the data represent the classification of points in images, they
+only include what was present, not what was also absent. For example,
+if all five points are Algae, then this also means that all other
+functional groups are absent - yet this information is lacking in the
+data. For modelling purposes it is vital that we fill in all the zero
+values.
+
+To do so, we must create a data set that contains every GROUP in every
+IMAGE.
+
+
+```{r}
+GROUPS <- dat |> pull(GROUP) |> unique()
+data.filler <- dat %>%
+  dplyr::select(
+    starts_with("site"),
+    survey_start_date,
+    #Year,
+    survey_depth,
+    transect_id,
+    image_id,
+    type,
+    ## GROUP,
+    TOTAL) |> 
+  distinct() |> 
+ tidyr::crossing(GROUP = GROUPS) 
+
+dat <-
+  dat |> 
+  full_join(data.filler) |>
+  group_by(
+    across(c(starts_with("site"),
+      survey_start_date,
+      #Year,
+      survey_depth,
+      transect_id,
+      image_id,
+      type,
+      GROUP
+    ))) |> 
+  mutate(COUNT = ifelse(is.na(COUNT), 0, COUNT),
+    TOTAL = max(TOTAL, na.rm = TRUE)
+  )
+dat |> as.data.frame() |> head() 
+```
+
+## Sum to transect level
+
+
+```{r}
+## Now sum up to transect level
+dat <- 
+  dat |>
+  ungroup(image_id) |>
+  summarise(COUNT = sum(COUNT),
+    TOTAL = sum(TOTAL)
+  ) |> 
+  ungroup() |> 
+  droplevels()
+dat |> as.data.frame() |> head() 
+```
+
+## Generate a year field
+
+```{r}
+#| label: mutateYear
+dat <-
+  dat |>
+  mutate(Year = lubridate::year(survey_start_date),
+    TropYear = lubridate::year(survey_start_date + months(3))
+  ) 
+dat |> as.data.frame() |> head() 
+```
+
+## Generate Reef_id
+
+```{r}
+#| label: mutataReef_id
+dat <-
+  dat |>
+  mutate(Reef_id = str_replace(site_name, "(.*)_.*", "\\1"))
+
+dat |> as.data.frame() |> head() 
+```
+## Create a variable to compare two groups of sites
+```{r}
+dat <- dat |> 
+  mutate(SAV_UPO = str_replace(site_name, "(.*)_.*", "\\1"),
+         SAV_UPO = factor(SAV_UPO))
+```
+
+
+## Declare all character vectors as categorical
+
+We will also create a categorical version of year.
+
+```{r}
+#| label: declare factors
+dat <-
+  dat |>
+  mutate(across(where(is.character), factor))
+
+dat |> as.data.frame() |> head() 
+```
+##Mapping
+```{r}
+reefs <- read_sf("../data/GIS/reef_500_poly.shp")
+```
+
+```{r}
+cities<- maps::world.cities |> 
+  filter (country.etc == "Samoa") |> 
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+Samoa<- rnaturalearth::ne_countries(scale = 10, country = "Samoa", returnclass = "sf")
+#Samoa
+bbox<- Samoa |> st_bbox()
+ggplot()+
+  geom_sf(data=Samoa)+
+  geom_sf(data=reefs, fill = "lightblue") +
+  geom_sf(data = cities) +
+  #geom_point(data=cities, aes(y= lat, x=long))+
+  #geom_text(data = cities, aes(y = lat,x = long-0.05,label = name), hjust=1)+
+  ggspatial::annotation_north_arrow(location= "tr")+
+  ggspatial::annotation_scale()+
+  coord_sf(xlim=bbox[c("xmin", "xmax")],ylim = bbox[c("ymin", "ymax")])+
+  theme_bw()+
+  theme(axis.title = element_blank())
+```
+
+:::
+
+## Exploratory data analysis
+
+::: {.panel-tabset}
+
+### Time series plot
+
+```{r}
+#| label: EDA1
+#| fig.width: 8
+#| fig.height: 4
+
+dat |>
+  filter(type == "point_machine_classification", GROUP == "HC") |> 
+  ggplot(aes(y =  100*COUNT/TOTAL, x = SAV_UPO)) +
+  geom_point() +
+  #geom_line(aes(group = transect_id)) + 
+  scale_y_continuous("Hard coral cover (%)") +
+  #scale_colour_discrete("Survey depth (m)") +
+  #scale_x_datetime("Year", date_breaks = "1 years", date_labels = "%Y") + 
+  facet_wrap(~site_name) +
+  theme_classic()
+```
+```{r}
+dat_hc <- dat |>
+  filter(GROUP == "HC") |>
+  droplevels()
+
+```
+
+### Boxplots
+
+```{r}
+#| label: EDA2
+#| fig.width: 6
+#| fig.height: 4
+dat |>
+  filter(type == "point_machine_classification", GROUP == "HC") |> 
+  ggplot(aes(y =  100*COUNT/TOTAL, x = SAV_UPO)) +
+  geom_boxplot() 
+```
+
+**Conclusions -** variances are clearly not equal between the groups
+:::
+
+Benthic monitoring programs typically adopt a hierarchical sampling
+design in which (usually) fixed sampling units (such as quadrats or
+transects) are nested within in Sites which are in turn nested within
+progressively larger spatial units (e.g. Reefs within Regions). In
+such designs, monitors collect data from those same units over
+multiple years.  That is, the units are repeatedly measured.
+
+Such a design is an attempt to control some of the numerous sources of
+uncertainty that would otherwise make it very difficult to draw out a
+signal (temporal pattern) amongst the noise. If instead, researchers
+sampled different locations each year, it is much harder to uncouple
+how much of any changes are due to genuine temporal shifts and how
+much is due to just a shift in location.
+
+Whist this design does provide substantial statistical power
+advantages, it does introduce additional complexities to do with the
+independence of observations. Repeated observations from the same
+sampling units (transects etc) are not independent. Similarly,
+observations of sampling units that are close in space (or time) are
+likely to be highly correlated. This violates a important assumption
+that underlies most statistical analyses.
+
+Complex hierarchical statistical designs exist to accommodate these
+dependency issues. Although such analyses are very powerful, they are
+not a good starting point when learning how to fit models. This series
+of workshops is intended to progressively increase the complexity of
+the statistical designs and analyses.
+
+The current dataset represents only a tiny fraction of a much larger
+dataset that includes multiple sites, reefs and years. As such, it has
+been prepared to fill in for a very simple design/analyses.
+
+::: {.callout-important}
+Unfortunately, these data are still not appropriate for a very simple
+analyses for the following two reasons:
+
+- as we can see in the time series figure above, the earlier samples
+  were collected at a depth of 9m whereas the later samples were
+  collected at 7m
+- the samples each year are not independent as they were collected
+  from the same transects - that is the sampling units have been
+  repeatedly sampled and thus are not independent.
+
+I fully acknowledge this issue and therefore acknowledge that the
+analysis I will present is completely invalid.
+:::
+
+
+```{r, mhiden=TRUE}
+#| label: hard coral
+dat_hc <- dat |>
+  filter(GROUP == "HC") |>
+  droplevels()
+```
+
+
+
+# Fit models
+
+::: {.panel-tabset}
+
+## Binomial model
+
+$$
+\begin{align}
+y_{i} &\sim{} Bin(\pi_{i}, n_{i})\\
+log\left(\frac{\pi_i}{1-\pi_i}\right) &= \beta_0 + \beta_{i}\mathbf{X}\\
+\beta_0 \sim{} N(0, 1)\\
+\beta_{1-3} \sim{} N(0, 1)\\
+\end{align}
+$$
+
+:::: {.panel-tabset}
+
+### Define priors
+
+```{r}
+priors <- prior(normal(0,1), class = "Intercept")+
+  prior(normal(0,3), class = "b")+ #fixed prior
+  prior(student_t(3, 0, 1), class = "sd") #random prior
+
+form <- bf(COUNT | trials(TOTAL)~ SAV_UPO + (1|site_name)+ (1|transect_id),
+           family = binomial(link = "logit"))
+```
+
+### Fit prior only model
+
+```{r}
+#| label: Model1
+#| cache: true
+model1<- brm(form,
+             data = dat_hc,
+             prior = priors,
+             sample_prior = "only",
+             iter = 5000,
+             warmup = 1000,
+             chains = 3,
+             cores = 3,
+             thin = 5,
+             refresh = 1000,
+             control = list(adapt_delta = 0.99, max_treedepth = 20),
+             backend = "rstan")
+```
+```{r}
+#| fig.width: 10
+#| fig.height: 5
+
+model1 |>
+  conditional_effects() |>
+  plot( ask = FALSE) |>
+  wrap_plots()
+```
+
+
+### Fit full model
+```{r}
+#| label: Model1_2
+#| cache: true
+model1 <- update(model1, sample_prior = "yes")
+```
+
+
+
+
+
+
+### MCMC sampling diagnostics
+
+
+### Posterior probability checks
+```{r}
+model1 |>  SUYR_prior_and_posterior()
+model1$fit |> stan_trace()
+model1$fit |> stan_ac()
+model1$fit |> stan_rhat()
+model1$fit |> stan_ess()
+```
+
+```{r}
+#| fig.width: 12
+#| fig.height: 6
+model1 |> pp_check(type = "dens_overlay", ndraws = 100)
+resids <- model1 |> make_brms_dharma_res(integerResponse = FALSE)
+wrap_elements(~testUniformity(resids))+
+  wrap_elements(~plotResiduals(resids))+
+  #wrap_elements(~plotResiduals(resids))+
+  wrap_elements(~testDispersion(resids))
+```
+
+### Model validation
+
+
+
+::::
+
+:::
+
+# Model posterior summaries
+
+```{r}
+model1 |> as_draws_df() |>
+  summarise_draws(median, HDInterval::hdi,rhat,length,ess_bulk, ess_tail) |>
+  knitr::kable() |> 
+  head()
+```
+
+```{r}
+plogis(-1.64) 
+```
+
+
+
+
+# Further explorations
+
+::: {.panels-tabset}
+
+## Pairwise constrasts
+```{r}
+model1 |> 
+emmeans(~ SAV_UPO) |>
+  regrid() |>
+  pairs() |>
+  gather_emmeans_draws() |>
+  summarise(median_hdci(.value),
+            Pl = mean(.value < 0),
+            Pg = mean(.value > 0)) |>
+ knitr::kable()
+```
+```{r}
+model1 |> 
+emmeans(~ SAV_UPO) |>
+  regrid() |>
+  regrid(trans = "log") |>
+  pairs() |>
+  gather_emmeans_draws() |>
+  mutate(.value = exp(.value)) |> 
+  summarise(median_hdci(.value),
+            Pl = mean(.value < 1),
+            Pg = mean(.value > 1)) |>
+ knitr::kable()
+```
+
+## R2
+```{r}
+model1 |> bayes_R2(summary = FALSE, re_form = NA) |># ~(1|Reef_id) + (1| site_name)+ (1|transect_id)) |>
+  median_hdci()|>
+ knitr::kable() 
+```
+```{r}
+model1 |> bayes_R2(summary = FALSE, re_form = ~(1|site_name) + (1| transect_id)) |> 
+ median_hdci() |>
+ knitr::kable()
+```
+
+```{r}
+model1 |> bayes_R2(summary = FALSE, re_form = ~ (1|transect_id)) |>
+  median_hdci()|>
+ knitr::kable()
+```
+
+
+:::
+# Summary figures
+```{r}
+#| fig.width: 10
+#| fig.height: 5
+
+model1 |>
+  conditional_effects() |>
+  plot( ask = FALSE) |>
+  wrap_plots()
+```
+
+```{r}
+g1<-
+  model1 |>
+  emmeans(~SAV_UPO, type = "response") |>
+  as.data.frame() |>
+  #gather_emmeans_draws() |>
+  #mutate(fit = plogis(.value)) |>
+  #summarise(median_hdci(fit)) |>
+  ggplot(aes(y = prob, x = SAV_UPO))+
+  geom_pointrange(aes(ymin = lower.HPD, ymax = upper.HPD))+
+  scale_y_continuous("Coral Cover(%)", labels = scales::label_number(scale = 100))+
+  #scale_x_discrete("COTs Outbreak", breaks = c(0,1), labels = c("No COTs", "COTS"))+
+  theme_classic()
+#| fig.width: 8
+#| fig.height: 4
+(g1 +annotate_npc("  a)", x = 0, y = 1, hjust = 0, vjust = 1))
+```
+```{r}
+g2<-
+   model1|>
+  emmeans(~SAV_UPO,type = "response") |>
+  regrid () |>
+  pairs() |> #percentage changes to produce the plot 
+  gather_emmeans_draws() |> #give me all 2400 of the values
+  mutate(contrast = str_replace_all(contrast, "SAV_UPO", "")) |> #replace fYear with nothing 
+  ggplot(aes(x = .value, y = contrast))+ #the column .value on x axis
+  stat_halfeye(aes(fill = after_stat(level)), .width = c(0.66, 0.95,1))+ #produce density plots and fill it according to different proportion of the data
+ # scale_fill_viridis_c() +
+  scale_fill_brewer(palette = "Blues")+ #overwritten to have a different color pallet, color brewer is used for mapping you can change it to any color 
+  geom_vline(xintercept = 0, linetype = "dashed")+ #dashed line 
+  scale_x_continuous("Effect size")+ #providing nicer labels
+  scale_y_discrete("") +
+  theme_classic()
+```
+```{r}
+#| fig.width: 12
+#| fig.height: 8
+(g1 +annotate_npc(" a)", x = 0, y = 1, hjust = 0, vjust = 1))+
+(g2 + annotate_npc(" b)", x = 0, y = 1, hjust = 0, vjust = 1))
+```
+```{r}
+sessionInfo()
+```
+
